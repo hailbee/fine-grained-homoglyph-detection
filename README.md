@@ -1,1 +1,1 @@
-# fine-grained-homoglyph-detection
+# Hit-Zone Aware Embedding Models for Fine-Grained Visual Homoglyph Detection
