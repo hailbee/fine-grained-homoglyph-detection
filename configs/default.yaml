@@ -1,0 +1,11 @@
+data:
+  pkl_path: data/splits/train.pkl
+
+rendering:
+  height: 32
+  background: black   # 'white' → blank=1.0 ink=0.0 | 'black' → blank=0.0 ink=1.0
+
+slicing:
+  slice_width: 4
+  stride: 4           # set equal to slice_width for non-overlapping strips
+  remove_padding: false
