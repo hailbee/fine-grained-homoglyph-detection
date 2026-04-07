@@ -1,3 +1,5 @@
 numpy
 Pillow
 torch
+scikit-learn
+pyyaml

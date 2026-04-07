@@ -6,6 +6,7 @@ def slice_image(
     slice_width: int = 4,
     stride: int | None = None,
     remove_padding: bool = False,
+    pad_to_width: int | None = None,
 ) -> np.ndarray:
     """Slice a 2-D grayscale image into overlapping (or non-overlapping) column strips.
 
@@ -16,6 +17,10 @@ def slice_image(
             slice_width (non-overlapping) when None
         remove_padding: if True, strip leading and trailing columns where every
             pixel is exactly 0.0 or 1.0 (pure background, no ink) before slicing
+        pad_to_width: if set, pad (or truncate) the image to exactly this many
+            columns before slicing, using the corner pixel value as background.
+            Setting slice_width == pad_to_width yields a single strip of the
+            whole image.
 
     Returns:
         float32 array of shape (num_slices, height, slice_width)
@@ -29,6 +34,15 @@ def slice_image(
         content_cols = np.where(~col_is_padding)[0]
         if content_cols.size > 0:
             img = img[:, content_cols[0] : content_cols[-1] + 1]
+
+    if pad_to_width is not None:
+        height, width = img.shape
+        if width < pad_to_width:
+            bg_val = float(img[0, 0])  # corner pixel is always background
+            pad = np.full((height, pad_to_width - width), bg_val, dtype=np.float32)
+            img = np.concatenate([img, pad], axis=1)
+        elif width > pad_to_width:
+            img = img[:, :pad_to_width]
 
     height, width = img.shape
     starts = range(0, width - slice_width + 1, stride)

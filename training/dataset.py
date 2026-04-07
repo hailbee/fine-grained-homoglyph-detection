@@ -47,12 +47,14 @@ class NamePairDataset(Dataset):
         stride: int | None = None,
         remove_padding: bool = False,
         background: str = "black",
+        pad_to_width: int | None = None,
     ) -> None:
         self.height = height
         self.slice_width = slice_width
         self.stride = stride
         self.remove_padding = remove_padding
         self.background = background
+        self.pad_to_width = pad_to_width
 
         with Path(pkl_path).open("rb") as f:
             self.rows: list[tuple[str, str, int]] = pickle.load(f)
@@ -70,6 +72,7 @@ class NamePairDataset(Dataset):
                 slice_width=self.slice_width,
                 stride=self.stride,
                 remove_padding=self.remove_padding,
+                pad_to_width=self.pad_to_width,
             )
             return torch.from_numpy(slices)  # (num_slices, height, slice_width)
 
@@ -129,7 +132,3 @@ if __name__ == "__main__":
     batch_a, batch_b, batch_labels = next(iter(loader))
     print(f"Batch:     slices_a={tuple(batch_a.shape)}  "
           f"slices_b={tuple(batch_b.shape)}  labels={batch_labels.tolist()}")
-
-In models/encoder.py, implement a VisualEncoder class that takes a slice sequence tensor of shape (batch, num_slices, slice_dim) and returns a name embedding of shape (batch, embed_dim). The architecture should be: a Conv1D stem (two layers, kernel size 3, ReLU) followed by mean pooling. Make embed_dim a configurable parameter defaulting to 128. In models/similarity.py, implement a SimilarityHead that takes two embeddings, computes cosine similarity, and passes it through a single linear layer to a binary logit.
-
-In models/encoder.py, implement three pooling options after the Conv1D stem, selectable via a pooling parameter: 'mean' (global average pooling across the slice dimension), 'max' (global max pooling), and 'attention' (a single-layer attention pooling: a learned linear layer projects each slice to a scalar score, softmax is applied across slices, and the output is the weighted sum of slice embeddings). All three should output shape (batch, embed_dim). Add pooling to configs/default.yaml with default value 'mean'.
