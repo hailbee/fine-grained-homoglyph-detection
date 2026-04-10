@@ -3,3 +3,5 @@ Pillow
 torch
 scikit-learn
 pyyaml
+rapidfuzz
+pandas

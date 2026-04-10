@@ -7,11 +7,15 @@ The pipeline runs in this order:
 ```
 data/raw/  →  training/make_splits.py  →  data/splits/
                                                  ↓
-                                    training/train.py  (or strip_design_sweep.py)
-                                                 ↓
-                                         outputs/runs/
-                                                 ↓
-                                    evaluation/summarize.py
+                          ┌──────────────────────┴──────────────────────┐
+                          │                                             │
+              training/train.py                          training/train_glyphnet.py
+           (or strip_design_sweep.py)                                   │
+                          │                                  outputs/runs/glyphnet/
+                  outputs/runs/                                         │
+                          │                          ┌──────────────────┘
+                          ↓                          ↓
+                  evaluation/summarize.py    evaluation/baselines.py
 ```
 
 ---
@@ -45,6 +49,7 @@ data/raw/  →  training/make_splits.py  →  data/splits/
 | `dataset.py` | `NamePairDataset` — renders and slices name pairs on-the-fly; `collate_fn` pads variable-length slice sequences into `(B, max_slices, height, slice_width)` tensors. |
 | `train.py` | **Single training run.** Reads hyperparameters from `configs/default.yaml` (or `--config`). Saves `best.pt`, `config.yaml`, and `log.csv` to `outputs/runs/<run_name>/`. |
 | `strip_design_sweep.py` | **Hyperparameter sweep.** Trains across all combinations of pooling, background, slice width, stride, and padding removal. Appends each result to `outputs/results.csv`. Supports `--resume` to continue an interrupted sweep. |
+| `train_glyphnet.py` | **GlyphNet training.** Trains the GlyphNet CNN on individual rendered domain-name images (pairs are expanded into two per-name samples). Saves `best.pt` and `log.csv` to `outputs/runs/glyphnet/`. Required before running the `glyphnet` baseline in `evaluation/baselines.py`. |
 
 ---
 
@@ -54,6 +59,7 @@ data/raw/  →  training/make_splits.py  →  data/splits/
 |------|---------|
 | `encoder.py` | `VisualEncoder` — takes `(batch, num_slices, height, slice_width)`, flattens each slice, runs two Conv1D layers, and pools into a `(batch, embed_dim)` embedding. Supports `mean`, `max`, and `attention` pooling. |
 | `similarity.py` | `SimilarityHead` — computes cosine similarity between two embeddings, passes the scalar through a linear layer to produce a binary logit. Use with `BCEWithLogitsLoss`. |
+| `glyphnet.py` | `GlyphNet` — binary spoof/non-spoof CNN classifier. Three Conv2D blocks each followed by a CBAM attention module (Gupta et al., 2023 style), global average pooling, and a two-layer linear head producing a single logit. Input: `(B, 1, H, W)` grayscale image. |
 
 ---
 
@@ -70,6 +76,37 @@ data/raw/  →  training/make_splits.py  →  data/splits/
 | File | Purpose |
 |------|---------|
 | `summarize.py` | **Run after the sweep.** Reads `outputs/results.csv` and prints the top-N configurations by val AUC plus the marginal effect of each design axis (pooling, background, slice width, padding). |
+| `baselines.py` | **Baseline evaluation.** Evaluates six baseline methods on the test split and writes ROC-AUC, average precision, and best-threshold F1 to `outputs/results_baselines.csv`. See [Baselines](#baselines) below. |
+
+---
+
+## Baselines
+
+`evaluation/baselines.py` measures six competing approaches. Each returns a similarity score in \[0, 1\] (higher = more likely a spoof pair). Metrics reported: ROC-AUC, average precision, and best-threshold F1.
+
+| Method | Category | Description |
+|--------|----------|-------------|
+| `levenshtein` | String edit distance | Normalized Levenshtein similarity via rapidfuzz. |
+| `damerau_levenshtein` | String edit distance | Normalized Damerau-Levenshtein (handles adjacent transpositions) via rapidfuzz. |
+| `token_set_ratio` | String similarity | Token Set Ratio via rapidfuzz, scaled to \[0, 1\]. |
+| `typo_pegging` | Visual-aware edit distance | Position-weighted edit distance with a hand-crafted visual confusion matrix. Earlier character positions are weighted more heavily; substitutions between visually confusable pairs (0/O, 1/l/I, rn/m, v/w, c/d) are penalized at 25% of the normal substitution cost. |
+| `word_embedding` | Semantic embedding | Cosine similarity between mean fastText character n-gram vectors (`fasttext-wiki-news-subwords-300`, loaded via **gensim**). Included as a negative control — semantic embeddings encode meaning, not visual form, so they are expected to perform poorly on homoglyphs. |
+| `glyphnet` | CNN classifier | Average spoof probability from a trained `GlyphNet` CNN (3× Conv2D + CBAM, Gupta et al. 2023 style). Each name in the pair is rendered independently; the pair score is the mean sigmoid output. **Requires training first** via `training/train_glyphnet.py`. Checkpoint must exist at `outputs/runs/glyphnet/best.pt`. |
+
+### Running baselines
+
+```bash
+# Train GlyphNet first (if not already done):
+python training/train_glyphnet.py
+
+# Run all six baselines on the test split:
+python evaluation/baselines.py
+
+# Optional overrides:
+python evaluation/baselines.py --test data/splits/test.csv --out outputs/results_baselines.csv
+```
+
+> **Note:** The `word_embedding` baseline requires `gensim`, which is not in `requirements.txt`. Install it separately: `pip install gensim`. The ~1 GB fastText model is downloaded automatically on the first run via `gensim.downloader`.
 
 ---
 
@@ -102,11 +139,22 @@ Upload the project directory excluding `.venv/` and any `__pycache__/` folders:
 fine-grained-homoglyph-detection/
 ├── configs/
 ├── data/
+│   └── raw/            # must include domains_spoof.pkl (source of truth)
 ├── evaluation/
+│   ├── baselines.py
+│   └── summarize.py
 ├── models/
+│   ├── encoder.py
+│   ├── glyphnet.py     # required by train_glyphnet.py and baselines.py
+│   └── similarity.py
 ├── notebooks/          # optional — only needed for exploration
 ├── rendering/
 ├── training/
+│   ├── dataset.py
+│   ├── make_splits.py
+│   ├── strip_design_sweep.py
+│   ├── train.py
+│   └── train_glyphnet.py
 ├── outputs/            # can start empty; created automatically
 └── requirements.txt
 ```
@@ -130,6 +178,9 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements.txt
+
+# Extra dependency for the word_embedding baseline (downloads ~1 GB fastText model on first run):
+pip install gensim
 ```
 
 > If the cluster provides a PyTorch module (e.g. via `module load pytorch`), load it before creating the venv to avoid re-downloading large binaries.
@@ -168,7 +219,7 @@ python training/strip_design_sweep.py --sweep-epochs 5 --max-runs 3
 
 The sweep trains 72 combinations (3 pooling × 2 padding × 2 background × 3 slice widths × 2 strides). Each result is appended to `outputs/results.csv` as it completes, so the sweep is safe to interrupt and resume.
 
-**Step 3 — Summarise results**
+**Step 3 — Summarise sweep results**
 
 ```bash
 python evaluation/summarize.py
@@ -177,6 +228,20 @@ python evaluation/summarize.py --results outputs/results.csv --top 10
 ```
 
 Prints the top-N configs by val AUC and the marginal effect of each design axis.
+
+**Step 4 — Train GlyphNet** (required before running baselines)
+
+```bash
+python training/train_glyphnet.py
+# Checkpoint saved to outputs/runs/glyphnet/best.pt
+```
+
+**Step 5 — Evaluate baselines**
+
+```bash
+python evaluation/baselines.py
+# Results saved to outputs/results_baselines.csv
+```
 
 ---
 
