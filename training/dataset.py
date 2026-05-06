@@ -85,32 +85,34 @@ class NamePairDataset(Dataset):
 
 def collate_fn(
     batch: list[tuple[Tensor, Tensor, Tensor]],
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Pad slice sequences to the longest sequence in the batch.
 
     Args:
         batch: List of (slices_a, slices_b, label) tuples from __getitem__.
 
     Returns:
-        slices_a: (B, max_slices, height, slice_width)  — zero-padded
-        slices_b: (B, max_slices, height, slice_width)  — zero-padded
-        labels:   (B,)
+        slices_a:  (B, max_slices, height, slice_width)  — zero-padded
+        lengths_a: (B,) int64 — actual (unpadded) slice counts for slices_a
+        slices_b:  (B, max_slices, height, slice_width)  — zero-padded
+        lengths_b: (B,) int64 — actual (unpadded) slice counts for slices_b
+        labels:    (B,)
     """
     slices_a_list, slices_b_list, labels = zip(*batch)
 
-    def pad_sequences(seqs: tuple[Tensor, ...]) -> Tensor:
-        max_len = max(s.shape[0] for s in seqs)
+    def pad_sequences(seqs: tuple[Tensor, ...]) -> tuple[Tensor, Tensor]:
+        lengths = torch.tensor([s.shape[0] for s in seqs], dtype=torch.long)
+        max_len = int(lengths.max().item())
         _, H, W = seqs[0].shape
         out = torch.zeros(len(seqs), max_len, H, W, dtype=seqs[0].dtype)
         for i, s in enumerate(seqs):
             out[i, : s.shape[0]] = s
-        return out
+        return out, lengths
 
-    return (
-        pad_sequences(slices_a_list),
-        pad_sequences(slices_b_list),
-        torch.stack(labels),
-    )
+    padded_a, lengths_a = pad_sequences(slices_a_list)
+    padded_b, lengths_b = pad_sequences(slices_b_list)
+
+    return padded_a, lengths_a, padded_b, lengths_b, torch.stack(labels)
 
 
 if __name__ == "__main__":

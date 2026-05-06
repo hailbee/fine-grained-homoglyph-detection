@@ -1,4 +1,4 @@
-run_name: null          # defaults to a UTC timestamp at launch time
+run_name: bilstm          # defaults to a UTC timestamp at launch time
 
 data:
   train_pkl: data/splits/train.pkl
@@ -16,7 +16,7 @@ slicing:
   pad_to_width: null    # if set, pad/truncate image to this width before slicing
 
 model:
-  encoder_type: conv1d  # 'conv1d' | 'bilstm' | 'transformer'
+  encoder_type: bilstm  # reserved for future encoder variants
   embed_dim: 128
   pooling: mean         # 'mean' | 'max' | 'attention'
 
@@ -26,6 +26,3 @@ training:
   lr: 1.0e-3
   num_workers: 4        # set > 0 on Linux/Mac; keep 0 on Windows
   seed: 7 # is best 
-
-# 0.9074, 0.9423 seed 0
-# 0.9148, 0.9528 seed 7

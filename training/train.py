@@ -18,6 +18,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import random
+
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -30,6 +33,19 @@ sys.path.insert(0, str(ROOT))
 from models.encoder import VisualEncoder
 from models.similarity import SimilarityHead
 from training.dataset import NamePairDataset, collate_fn
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +83,7 @@ def build_model(cfg: dict, device: torch.device):
         slice_dim=slice_dim,
         embed_dim=m["embed_dim"],
         pooling=m["pooling"],
+        encoder_type=m.get("encoder_type", "conv1d"),
     ).to(device)
     head = SimilarityHead(embed_dim=m["embed_dim"]).to(device)
     return encoder, head
@@ -89,11 +106,14 @@ def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
         remove_padding=s["remove_padding"],
         pad_to_width=s.get("pad_to_width"),
     )
+    g = torch.Generator()
+    g.manual_seed(t["seed"])
     loader_kwargs = dict(
         batch_size=t["batch_size"],
         collate_fn=collate_fn,
         num_workers=t["num_workers"],
         pin_memory=True,
+        generator=g,
     )
 
     train_ds = NamePairDataset(ROOT / cfg["data"]["train_pkl"], **dataset_kwargs)
@@ -153,15 +173,17 @@ def run_epoch(
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        for batch_idx, (slices_a, slices_b, labels) in enumerate(loader):
+        for batch_idx, (slices_a, lengths_a, slices_b, lengths_b, labels) in enumerate(loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
-            slices_a = slices_a.to(device)
-            slices_b = slices_b.to(device)
-            labels_f = labels.float().to(device)
+            slices_a  = slices_a.to(device)
+            lengths_a = lengths_a.to(device)
+            slices_b  = slices_b.to(device)
+            lengths_b = lengths_b.to(device)
+            labels_f  = labels.float().to(device)
 
-            emb_a  = encoder(slices_a)
-            emb_b  = encoder(slices_b)
+            emb_a  = encoder(slices_a, lengths_a)
+            emb_b  = encoder(slices_b, lengths_b)
             logits = head(emb_a, emb_b)
             loss   = criterion(logits, labels_f)
 
@@ -186,22 +208,31 @@ def run_epoch(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--seed", type=int, default=None, help="Override the seed in the config")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help=(
+            "Resume an interrupted run.  The run directory is resolved from "
+            "the config's run_name (or the UTC timestamp used at launch time). "
+            "Requires latest.pt to exist in that directory."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_config(ROOT / args.config)
+    if args.seed is not None:
+        cfg["training"]["seed"] = args.seed
+    set_seed(cfg["training"].get("seed", 42))
     run_name = resolve_run_name(cfg)
-    cfg["run_name"] = run_name          # bake the resolved name back in
+    cfg["run_name"] = run_name
 
     run_dir = ROOT / "outputs" / "runs" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    save_config(cfg, run_dir / "config.yaml")
-    shutil.copy(ROOT / args.config, run_dir / "source_config.yaml")
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Run: {run_name}")
     print(f"Dir: {run_dir}")
-    print(f"Device: {device}\n")
+    print(f"Device: {device}")
 
     train_loader, val_loader = build_loaders(cfg)
     encoder, head = build_model(cfg, device)
@@ -210,14 +241,42 @@ def main() -> None:
     optimizer = torch.optim.Adam(params, lr=cfg["training"]["lr"])
     criterion = nn.BCEWithLogitsLoss()
 
-    log_path = run_dir / "log.csv"
-    with log_path.open("w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "val_auc"])
-
-    best_auc = -1.0
     num_epochs = cfg["training"]["num_epochs"]
+    start_epoch = 1
+    best_auc = -1.0
+    log_path = run_dir / "log.csv"
 
-    for epoch in range(1, num_epochs + 1):
+    # ------------------------------------------------------------------
+    # Resume from latest.pt if requested
+    # ------------------------------------------------------------------
+    if args.resume:
+        latest_path = run_dir / "latest.pt"
+        if not latest_path.exists():
+            raise FileNotFoundError(
+                f"--resume requested but {latest_path} does not exist. "
+                "Cannot resume without a latest.pt checkpoint."
+            )
+        print(f"\nResuming from {latest_path} ...")
+        ckpt = torch.load(latest_path, map_location=device)
+        encoder.load_state_dict(ckpt["encoder"])
+        head.load_state_dict(ckpt["head"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        best_auc    = ckpt["best_auc"]
+        print(f"  Resumed at epoch {ckpt['epoch']}  best_auc_so_far={best_auc:.4f}")
+        print(f"  Continuing from epoch {start_epoch} to {num_epochs}\n")
+        # Log file already exists from the previous run; keep it as-is.
+    else:
+        save_config(cfg, run_dir / "config.yaml")
+        shutil.copy(ROOT / args.config, run_dir / "source_config.yaml")
+        with log_path.open("w", newline="") as f:
+            csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "val_auc"])
+        print()
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+    for epoch in range(start_epoch, num_epochs + 1):
         t0 = time.time()
 
         train_loss, _, _ = run_epoch(
@@ -253,6 +312,18 @@ def main() -> None:
                 run_dir / "best.pt",
             )
             print(f"  ✓ new best val_auc={best_auc:.4f} — checkpoint saved")
+
+        # Save latest.pt after every epoch so the run can be resumed.
+        torch.save(
+            {
+                "epoch":     epoch,
+                "best_auc":  best_auc,
+                "encoder":   encoder.state_dict(),
+                "head":      head.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            },
+            run_dir / "latest.pt",
+        )
 
     print(f"\nTraining complete. Best val_auc={best_auc:.4f}")
     print(f"Artifacts saved to {run_dir}")

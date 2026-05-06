@@ -15,7 +15,8 @@ Six methods are implemented, each returning a similarity score in [0, 1]
 Usage:
     python evaluation/baselines.py
     python evaluation/baselines.py --test data/splits/test.csv
-    python evaluation/baselines.py --out  outputs/results_baselines.csv
+    python evaluation/baselines.py --out  baseline_results.csv
+    python evaluation/baselines.py --resume          # skip already-completed methods
 """
 from __future__ import annotations
 
@@ -29,8 +30,13 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import distance as rf_distance, fuzz as rf_fuzz
 from sklearn.metrics import (
+    accuracy_score,
     average_precision_score,
+    confusion_matrix,
     f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
 
@@ -288,10 +294,10 @@ class GlyphNetBaseline:
 
     def _spoof_prob(self, name: str) -> float:
         """Return the spoof probability for a single rendered domain name."""
+        self._load()  # must come first — adds ROOT to sys.path before imports below
         import torch
         from rendering.renderer import render_name as _render_name
 
-        self._load()
         img = _render_name(name, **self._render_cfg)         # (H, W) float32
         # (1, 1, H, W) — batch=1, channel=1
         x = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).to(self._device)
@@ -333,52 +339,112 @@ METHODS: dict[str, callable] = {
 }
 
 
-def _best_f1(labels: np.ndarray, scores: np.ndarray) -> float:
-    """Return the maximum F1 score across all score thresholds."""
-    # Use unique score values as candidate thresholds.
+def _best_threshold_metrics(
+    labels: np.ndarray, scores: np.ndarray
+) -> dict[str, float]:
+    """Return classification metrics at the threshold that maximises F1.
+
+    Returns a dict with keys: ``threshold``, ``f1``, ``accuracy``,
+    ``precision``, ``recall``, ``specificity``, ``mcc``.
+    """
     thresholds = np.unique(scores)
-    best = 0.0
+    best_f1 = -1.0
+    best_t = thresholds[0]
     for t in thresholds:
         preds = (scores >= t).astype(int)
         f = f1_score(labels, preds, zero_division=0)
-        if f > best:
-            best = f
-    return best
+        if f > best_f1:
+            best_f1 = f
+            best_t = t
+
+    preds = (scores >= best_t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    return {
+        "threshold":   float(best_t),
+        "f1":          float(best_f1),
+        "accuracy":    float(accuracy_score(labels, preds)),
+        "precision":   float(precision_score(labels, preds, zero_division=0)),
+        "recall":      float(recall_score(labels, preds, zero_division=0)),
+        "specificity": float(specificity),
+        "mcc":         float(matthews_corrcoef(labels, preds)),
+    }
 
 
-def evaluate_all_baselines(df: pd.DataFrame) -> pd.DataFrame:
-    """Evaluate every baseline method on *df*.
+def evaluate_all_baselines(
+    df: pd.DataFrame,
+    out_path: Path | None = None,
+    resume: bool = False,
+) -> pd.DataFrame:
+    """Evaluate every baseline method on *df*, saving results incrementally.
 
     Args:
         df: DataFrame with columns ``fraudulent_name``, ``real_name``, ``label``.
+        out_path: If provided, results are written to this CSV after each method
+                  completes so progress is never lost.
+        resume:   If True and *out_path* exists, skip methods already present in
+                  that file and append new results to it.
 
     Returns:
         DataFrame with one row per method and columns:
-        ``method``, ``roc_auc``, ``avg_precision``, ``f1_at_best_threshold``.
+        ``method``, ``roc_auc``, ``avg_precision``,
+        ``f1``, ``accuracy``, ``precision``, ``recall``,
+        ``specificity``, ``mcc``, ``best_threshold``.
+
+        Threshold-dependent metrics are computed at the threshold that
+        maximises F1.
     """
     labels = df["label"].astype(int).to_numpy()
-    results = []
+
+    # Load previously completed results when resuming.
+    completed: set[str] = set()
+    results: list[dict] = []
+    if resume and out_path is not None and out_path.exists():
+        existing = pd.read_csv(out_path)
+        results = existing.to_dict("records")
+        completed = set(existing["method"].tolist())
+        if completed:
+            print(f"  Resuming — skipping already-completed methods: {sorted(completed)}")
 
     for name, fn in METHODS.items():
+        if name in completed:
+            print(f"  {name:<24}  [skipped — already in {out_path.name}]")
+            continue
+
         scores = np.array([
             fn(row["fraudulent_name"], row["real_name"])
             for _, row in df.iterrows()
         ])
 
-        roc_auc      = roc_auc_score(labels, scores)
-        avg_prec     = average_precision_score(labels, scores)
-        f1_best      = _best_f1(labels, scores)
+        roc_auc  = roc_auc_score(labels, scores)
+        avg_prec = average_precision_score(labels, scores)
+        tm       = _best_threshold_metrics(labels, scores)
 
         results.append({
-            "method":               name,
-            "roc_auc":              round(roc_auc,  6),
-            "avg_precision":        round(avg_prec, 6),
-            "f1_at_best_threshold": round(f1_best,  6),
+            "method":         name,
+            "roc_auc":        round(roc_auc,        6),
+            "avg_precision":  round(avg_prec,        6),
+            "f1":             round(tm["f1"],         6),
+            "accuracy":       round(tm["accuracy"],   6),
+            "precision":      round(tm["precision"],  6),
+            "recall":         round(tm["recall"],     6),
+            "specificity":    round(tm["specificity"],6),
+            "mcc":            round(tm["mcc"],        6),
+            "best_threshold": round(tm["threshold"],  6),
         })
         print(
-            f"  {name:<24}  roc_auc={roc_auc:.4f}  "
-            f"avg_prec={avg_prec:.4f}  f1={f1_best:.4f}"
+            f"  {name:<24}  roc_auc={roc_auc:.4f}  avg_prec={avg_prec:.4f}  "
+            f"f1={tm['f1']:.4f}  acc={tm['accuracy']:.4f}  "
+            f"prec={tm['precision']:.4f}  rec={tm['recall']:.4f}  "
+            f"spec={tm['specificity']:.4f}  mcc={tm['mcc']:.4f}  "
+            f"thr={tm['threshold']:.4f}"
         )
+
+        # Save incrementally so a crash doesn't lose completed work.
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(results).to_csv(out_path, index=False)
 
     return pd.DataFrame(results)
 
@@ -417,8 +483,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--out",
-        default="outputs/results_baselines.csv",
-        help="Where to write the results CSV.",
+        default="baseline_results.csv",
+        help="Where to write the results CSV (default: baseline_results.csv).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip baselines already present in the output CSV and append new results.",
     )
     args = parser.parse_args()
 
@@ -430,10 +501,8 @@ def main() -> None:
     print(f"Loaded {len(df):,} test pairs  (positive rate: {df['label'].mean():.3f})\n")
 
     print("Running baselines ...")
-    results_df = evaluate_all_baselines(df)
+    results_df = evaluate_all_baselines(df, out_path=out_path, resume=args.resume)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    results_df.to_csv(out_path, index=False)
     print(f"\nResults saved to {out_path}")
     print(results_df.to_string(index=False))
 
